@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=59"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "tart-vlbi"
+version = "0.1.0"
+description = "TART VLBI inter-telescope correlation and analysis"
+requires-python = ">=3.10"
+dependencies = [
+    "astropy>=6.1",
+    "h5py>=3.15",
+    "matplotlib>=3.10",
+    "minio>=7.2",
+    "numpy>=2.2",
+    "pandas>=2.3",
+    "plotly>=6.5",
+    "requests>=2.32",
+    "scipy>=1.15",
+    "sp3>=1.1",
+    "tqdm>=4.67",
+]
+
+[project.optional-dependencies]
+dev = [
+    "jupyterlab>=4.5",
+    "ipywidgets>=8.1",
+    "ipympl>=0.9",
+]
