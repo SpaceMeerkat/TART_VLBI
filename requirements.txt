@@ -10,3 +10,4 @@ requests
 scipy
 sp3
 tqdm
+ipykernel
