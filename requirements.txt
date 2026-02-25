@@ -1,0 +1,12 @@
+# Core Dependencies
+astropy
+h5py
+matplotlib
+minio
+numpy
+pandas
+plotly
+requests
+scipy
+sp3
+tqdm
