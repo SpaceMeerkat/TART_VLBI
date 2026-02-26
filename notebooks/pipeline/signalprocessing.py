@@ -26,17 +26,23 @@ class signal_processing_handler:
 
         # FFT-based correlation
         V = np.fft.fft(voltage, n=nfft)
-        P = np.fft.fft(prn_filter, n=nfft)
+        # P = np.fft.fft(prn_filter, n=nfft)
+        # corr = np.fft.ifft(V * np.conj(P))
 
-        corr = np.fft.ifft(V * np.conj(P))
+        P = np.fft.fft(prn_filter[::-1], n=nfft)
+        corr = np.fft.ifft(V * P)
 
-        return corr[:len(voltage)]
+        return corr #corr[:len(voltage)]
 
     def get_correlations(self, TART, TART_DATA, Fs_baseband, acquisition_results, ref_antennas, satellite, prn_filters, interpolation_factor=1): 
         antenna_data = TART_DATA[TART]['data'][ref_antennas[satellite][TART]]
+        Fs = 16368000 # voltage stream sampling in Hz
+        obs_window = 50e-3 # 20ms cutout
+        antenna_data = antenna_data[:int(obs_window*Fs)]
         doppler_det = acquisition_results[TART][satellite]['doppler']
         code_doppler = doppler_det * (self.CODE_RATE / self.CARRIER_FREQ)
         code_rate_eff = self.CODE_RATE + code_doppler
+        ### Not using code doppler correction for now as it cannot account for large delay bug seen in results
         n_samples_original = len(antenna_data)
         n_samples_interp = n_samples_original * interpolation_factor
         # Create Doppler compensation carrier at interpolated rate
@@ -44,7 +50,8 @@ class signal_processing_handler:
         t_interp = np.arange(n_samples_interp) / Fs_interp
         doppler_carrier = np.exp(-1j * 2 * np.pi * doppler_det * t_interp).astype(np.complex64)
         # Interpolate real baseband signal
-        voltage_interp = resample_poly(antenna_data, interpolation_factor, 1).astype(np.complex64)
+        voltage_interp = antenna_data
+        # voltage_interp = resample_poly(antenna_data, interpolation_factor, 1).astype(np.complex64)
         # Ensure correct length
         if len(voltage_interp) > n_samples_interp:
             voltage_interp = voltage_interp[:n_samples_interp]
@@ -53,7 +60,7 @@ class signal_processing_handler:
         # Apply Doppler compensation (makes it complex)
         voltage_compensated = voltage_interp * doppler_carrier
         # Correlate with PRN code
-        prn_nominal = prn_filters[int(satellite[1:])]
+        prn_nominal = prn_filters[int(satellite[1:])]        
         corr = self.correlate_with_prn(voltage_compensated, prn_nominal)
         # Store magnitude
         antenna_correlation = np.abs(corr).astype(np.float32)
