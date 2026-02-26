@@ -36,7 +36,7 @@ class GPS_handler:
                 sat_pos_corr = np.array([0.0, 0.0, 0.0])
                 
                 # Iterative Light-Time + Sagnac Correction
-                for _ in range(2):
+                for _ in range(3):
                     t_trans = t_rec - astropy.time.TimeDelta(tau, format='sec')
                     
                     # Get SP3 position (Returns ITRS by default)
@@ -51,7 +51,7 @@ class GPS_handler:
                     sat_pos = np.array([pos_obj.x.value, pos_obj.y.value, pos_obj.z.value])
                     
                     # Sagnac Effect: Rotate sat position to frame at t_rec
-                    theta = self.omega_e * self.tau
+                    theta = self.omega_e * tau
                     cos_t, sin_t = np.cos(theta), np.sin(theta)
                     
                     x_corr = sat_pos[0] * cos_t + sat_pos[1] * sin_t
