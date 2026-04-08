@@ -12,6 +12,16 @@ def _acquire_worker(args):
     result = acq.acquire_satellite(voltages_bb_lpf, prn_upsampled, Fs)
     return tart_name, sat_id, result
 
+def _acquire_worker_chunked(args):
+    """Top-level worker for chunked multiprocessing Pool (must be picklable)."""
+    tart_name, sat_id, tart, last_idx, N_chunks, prn_upsampled, Fs = args
+    print(f"[{tart_name}] Starting PRN {sat_id}", flush=True)
+    acq = acquire_GPS(Fs)
+    result = acq.acquire_satellite_chunked(tart, last_idx, N_chunks, prn_upsampled, Fs,
+                                           tart_name=tart_name, sat_id=sat_id)
+    print(f"[{tart_name}] Done PRN {sat_id} — detected: {result['detected']}, doppler: {result['doppler']:.1f} Hz", flush=True)
+    return tart_name, sat_id, result
+
 class acquire_GPS:
 
     # Speed of light in m/s
@@ -70,7 +80,7 @@ class acquire_GPS:
 
         for i in range(self.CODE_LENGTH):
             # Output is XOR of G1 output and two G2 taps
-            ca[i] = g1[-1] ^ (g2[-tap1] ^ g2[-tap2])
+            ca[i] = g1[-1] ^ (g2[tap1-1] ^ g2[tap2-1])
 
             # Shift G1: feedback from positions 3 and 10 (indices 2 and 9)
             newbit_g1 = g1[2] ^ g1[9]
@@ -92,13 +102,61 @@ class acquire_GPS:
         prn_codes = {}
         for prn_num in range(1, 33):
             chips = self.generate_ca_prn(prn_num)
-            upsampled = np.repeat(chips, self.samples_per_chip)[:samples_per_ms]
+            # upsampled = np.repeat(chips, self.samples_per_chip)[:samples_per_ms]
+            t_chip = np.arange(1023) / 1.023e6
+            t_samp = np.arange(samples_per_ms) / 16368000
+            upsampled = np.interp(t_samp, t_chip, chips, period=1e-3)
+            
             prn_codes[prn_num] = upsampled.astype(np.complex64)
         print(f"Done.")
         return prn_codes
 
+    def acquire_satellite_chunked(self, data, last_idx, N_chunks, prn_upsampled, Fs,
+                          tart_name='', sat_id='',
+                          doppler_range=np.arange(-5000, 5001, 250)):
+
+        samples_per_ms = int(Fs / 1000)
+        PRN_fft = fft(prn_upsampled[:samples_per_ms])
+        t = np.arange(samples_per_ms, dtype=np.float32) / Fs
+
+        antenna_results = {}
+        for ant_idx in data['antenna_selection']:
+            print(f"  [{tart_name}] PRN {sat_id} — antenna {ant_idx}", flush=True)
+            chunk_SNRs = np.ones(int(N_chunks)) * -1
+            chunk_dopplers = np.zeros(int(N_chunks))
+            correlations = np.zeros((int(N_chunks), samples_per_ms))
+
+            for chunk_idx in range(int(N_chunks)):
+                chunk = np.split(data['data'][ant_idx][:last_idx], N_chunks)[chunk_idx]
+                signal = chunk.astype(np.complex64)
+                for f_doppler in doppler_range:
+                    segment = signal * np.exp(-1j * 2 * np.pi * f_doppler * t)
+                    corr = ifft(fft(segment) * np.conj(PRN_fft))
+                    power = np.abs(corr)**2
+                    SNR = np.max(power) / np.std(power)
+                    if SNR > chunk_SNRs[chunk_idx]:
+                        chunk_SNRs[chunk_idx] = SNR
+                        chunk_dopplers[chunk_idx] = f_doppler
+                        correlations[chunk_idx] = power
+
+            antenna_results[ant_idx] = {
+                'chunk_SNRs': chunk_SNRs,
+                'chunk_dopplers': chunk_dopplers,
+                'correlations': correlations,
+            }
+
+        best_antenna = max(antenna_results, key=lambda a: np.median(antenna_results[a]['chunk_SNRs']))
+        best_dopplers = antenna_results[best_antenna]['chunk_dopplers']
+        detected = bool(np.std(best_dopplers) < 750) if len(data['antenna_selection']) > 1 else True
+
+        return {'antenna_results': antenna_results,
+                'detected': detected, 
+                'doppler': np.median(best_dopplers),
+                'snrs': np.median(antenna_results[best_antenna]['chunk_SNRs']), 
+                'best_antenna': best_antenna}
+
     def acquire_satellite(self, voltages_bb_lpf, prn_upsampled, Fs,
-                          doppler_range=np.arange(-5000, 5001, 250),
+                          doppler_range=np.arange(-5000, 5001, 50),
                           T_coh_ms=1, N_noncoh=20):
 
         samples_per_ms = int(Fs / 1000)
@@ -141,6 +199,7 @@ class acquire_GPS:
                 segment = signal[k*N_coh:(k+1)*N_coh]
                 segment = segment * np.exp(-1j * 2 * np.pi * detected_doppler * t)
                 corr = ifft(fft(segment) * np.conj(PRN_fft))
+                # corr = ifft(fft(segment, 2*N) * np.conj(fft(prn, 2*N)))
                 noncoh_power += np.abs(corr)**2
             peak = np.max(noncoh_power)
             noise = np.median(noncoh_power)
@@ -160,21 +219,33 @@ class acquire_GPS:
             n_workers: number of Pool workers (defaults to cpu count)
 
         Returns:
-            dict: results[tart_name][sat_id] -> acquisition result
+            dict: results[tart_name][sat_id][antenna] -> chunked acquisition result
         """
+        chunk_duration = 1e-3  # 1 ms per chunk
+
+        # Pre-compute chunk params once per TART to avoid repeating for every (sat, antenna) job
+        tart_chunk_params = {}
+        for tart_name, tart in TART_DATA.items():
+            Fs = tart['Fs']
+            chunk_samples = chunk_duration * Fs
+            N_chunks = len(tart['data'][0]) // chunk_samples
+            last_idx = int(N_chunks * chunk_samples)
+            tart_chunk_params[tart_name] = (last_idx, int(N_chunks))
+
         work_items = []
         for sat_id in visible_satellites:
             prn_num = int(str(sat_id)[1:])
             prn = prn_codes[prn_num]
             for tart_name, tart in TART_DATA.items():
-                work_items.append((tart_name, sat_id, tart['data'], prn, tart['Fs']))
+                last_idx, N_chunks = tart_chunk_params[tart_name]
+                work_items.append((tart_name, sat_id, tart, last_idx, N_chunks, prn, tart['Fs']))
 
         results = {tart_name: {} for tart_name in TART_DATA}
-        print(f"Running parallel acquisition for {len(visible_satellites)} satellites ({len(work_items)} jobs, {n_workers or 'auto'} workers)...")
+        print(f"Running parallel chunked acquisition for {len(visible_satellites)} satellites ({len(work_items)} jobs, {n_workers or 'auto'} workers)...")
         print("=" * 60)
         with Pool(processes=n_workers) as pool:
             for tart_name, sat_id, result in tqdm(
-                pool.imap_unordered(_acquire_worker, work_items),
+                pool.imap_unordered(_acquire_worker_chunked, work_items),
                 total=len(work_items),
                 desc="Acquiring satellites",
             ):
@@ -189,7 +260,7 @@ class acquire_GPS:
         for tart_name in TART_DATA:
             results[tart_name] = {}
         for sat_id in tqdm(visible_satellites, desc="Acquiring satellites"):
-            prn_num = int(str(sat_id)[1:])  # safe even if sat_id was np.str_
+            prn_num = int(str(sat_id)[1:]) 
             prn = prn_codes[prn_num]
             for tart_name, tart in TART_DATA.items():
                 results[tart_name][sat_id] = self.acquire_satellite(tart['data'], prn, tart['Fs'])
@@ -211,11 +282,11 @@ class acquire_GPS:
     def snr_tables(self, acquisition_results, satellite_names, tart_names, SNR_limit=5):
         """Build and display one SNR table per satellite.
 
-        Each table has one row per TART site and 24 columns (one per antenna).
-        Cells with SNR < SNR_limit are highlighted with a desaturated red background.
+        Each table has one row per TART site. Columns are the union of all antenna
+        indices present across TARTs; antennas not used by a given TART show as NaN.
 
         Args:
-            acquisition_results: dict of {tart_name: {sat_id: {'snrs': array(24), ...}}}
+            acquisition_results: dict of {tart_name: {sat_id: {'antenna_results': {ant_idx: {...}}, ...}}}
             satellite_names: list/array of satellite IDs (e.g. ['G23', 'G28', 'G31'])
             tart_names: list of TART site names (e.g. ['rhodes', 'namibia'])
             SNR_limit: threshold below which cells are highlighted red (default 5)
@@ -223,9 +294,9 @@ class acquire_GPS:
         Returns:
             list of pandas Styler objects (one per satellite)
         """
-        antenna_cols = [f"Ant {i}" for i in range(24)]
-
         def _highlight_low_snr(val):
+            if pd.isna(val):
+                return "background-color: #d0d0d0"  # grey for antennas not used by this TART
             if val < SNR_limit:
                 return "background-color: #e8a0a0"  # desaturated red
             return ""
@@ -233,14 +304,30 @@ class acquire_GPS:
         styled_tables = []
         for sat_id in satellite_names:
             sat_id = str(sat_id)
+
+            # Collect median chunk SNR per antenna for each TART, and find union of all antenna indices
+            tart_antenna_snrs = {}
+            all_antennas = set()
+            for tart_name in tart_names:
+                ant_results = acquisition_results[tart_name][sat_id]['antenna_results']
+                tart_antenna_snrs[tart_name] = {
+                    ant_idx: np.median(ant_data['chunk_SNRs'])
+                    for ant_idx, ant_data in ant_results.items()
+                }
+                all_antennas.update(ant_results.keys())
+
+            sorted_antennas = sorted(all_antennas)
+            antenna_cols = [f"Ant {i}" for i in sorted_antennas]
+
             rows = []
             for tart_name in tart_names:
-                snrs = np.array(acquisition_results[tart_name][sat_id]['snrs'], dtype=float)
-                rows.append(snrs)
+                row = [tart_antenna_snrs[tart_name].get(a, np.nan) for a in sorted_antennas]
+                rows.append(row)
+
             df = pd.DataFrame(rows, index=list(tart_names), columns=antenna_cols)
             styler = (
                 df.style
-                .format("{:.2f}")
+                .format("{:.2f}", na_rep="—")
                 .map(_highlight_low_snr)
                 .set_caption(f"Satellite {sat_id}  (SNR limit = {SNR_limit})")
             )
